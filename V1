@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import { IBaseHook } from "v4-core/interfaces/IBaseHook.sol";
+import { PoolKey } from "v4-core/types/PoolKey.sol";
+import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+
+contract AntiMEVHook is IBaseHook {
+    IPoolManager public immutable poolManager;
+
+    // Store the last swap block & price for each sender
+    mapping(address => uint256) private lastSwapBlock;
+    mapping(address => uint256) private lastSwapPrice;
+
+    // Blocked MEV bot addresses (Including JaredFromSubway)
+    mapping(address => bool) public blockedAddresses;
+
+    // Swap cooldown period (in seconds)
+    uint256 public swapCooldown = 15; // Default: 15 seconds
+
+    // Store last swap timestamp for cooldown tracking
+    mapping(address => uint256) private lastSwapTimestamp;
+
+    // Error messages for reverts
+    error MEVDetected();
+    error SandwichDetected();
+    error BotBlocked();
+    error CooldownNotMet();
+
+    constructor(IPoolManager _poolManager) {
+        poolManager = _poolManager;
+
+        // Predefined MEV bot addresses (can be updated)
+        blockedAddresses[0xae2Fc483527B8EF99EB5D9B44875F005ba1FaE13] = true; // JaredFromSubway MEV bot
+        blockedAddresses[0x1f2F10D1C40777AE1Da742455c65828FF36Df387] = true; // Alternate Jared bot
+    }
+
+    function beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata
+    ) external override returns (bytes4) {
+        uint256 currentBlock = block.number;
+        uint256 previousBlock = lastSwapBlock[sender];
+
+        // Block known MEV bots before execution
+        if (blockedAddresses[sender]) {
+            revert BotBlocked();
+        }
+
+        // Prevent back-to-back swaps within the same block (Anti-Sandwich)
+        if (previousBlock == currentBlock) {
+            revert SandwichDetected();
+        }
+
+        // Enforce cooldown period to slow down bot activity
+        if (block.timestamp < lastSwapTimestamp[sender] + swapCooldown) {
+            revert CooldownNotMet();
+        }
+
+        // Fetch pool price before the swap
+        uint256 previousPrice = lastSwapPrice[sender];
+        uint256 currentPrice = getPoolPrice(key);
+
+        // Detect excessive price deviation (>1%) to prevent front-running
+        if (previousPrice != 0 && isSignificantDeviation(previousPrice, currentPrice)) {
+            revert MEVDetected();
+        }
+
+        // Update sender tracking
+        lastSwapBlock[sender] = currentBlock;
+        lastSwapPrice[sender] = currentPrice;
+        lastSwapTimestamp[sender] = block.timestamp;
+
+        return IBaseHook.beforeSwap.selector;
+    }
+
+    function afterSwap(
+        address,
+        PoolKey calldata,
+        IPoolManager.SwapParams calldata,
+        bytes calldata,
+        int256,
+        int256
+    ) external pure override returns (bytes4) {
+        return IBaseHook.afterSwap.selector;
+    }
+
+    function getPoolPrice(PoolKey calldata key) internal view returns (uint256) {
+        (uint160 sqrtPriceX96, , , , , , ) = poolManager.getSlot0(key);
+        return uint256(sqrtPriceX96);
+    }
+
+    function isSignificantDeviation(uint256 oldPrice, uint256 newPrice) internal pure returns (bool) {
+        uint256 deviation = oldPrice > newPrice ? oldPrice - newPrice : newPrice - oldPrice;
+        return deviation > (oldPrice / 100); // 1% price deviation threshold
+    }
+
+    // Update blocked addresses dynamically
+    function updateBlockedAddress(address _bot, bool _blocked) external {
+        blockedAddresses[_bot] = _blocked;
+    }
+
+    // Adjust swap cooldown duration
+    function updateCooldown(uint256 _cooldown) external {
+        require(_cooldown <= 60, "Cooldown too high"); // Max: 60 seconds
+        swapCooldown = _cooldown;
+    }
+}
