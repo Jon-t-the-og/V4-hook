@@ -4,35 +4,39 @@ pragma solidity ^0.8.20;
 import { IBaseHook } from "v4-core/interfaces/IBaseHook.sol";
 import { PoolKey } from "v4-core/types/PoolKey.sol";
 import { IPoolManager } from "v4-core/interfaces/IPoolManager.sol";
+import { IOracle } from "oracle-interface/IOracle.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-contract AntiMEVHook is IBaseHook {
+contract AntiMEVAutoBalancerHook is IBaseHook, Ownable, ReentrancyGuard {
     IPoolManager public immutable poolManager;
+    IOracle public priceOracle;
 
-    // Store the last swap block & price for each sender
     mapping(address => uint256) private lastSwapBlock;
     mapping(address => uint256) private lastSwapPrice;
-
-    // Blocked MEV bot addresses (Including JaredFromSubway)
+    mapping(address => uint256) private lastSwapTimestamp;
     mapping(address => bool) public blockedAddresses;
 
-    // Swap cooldown period (in seconds)
-    uint256 public swapCooldown = 15; // Default: 15 seconds
+    uint256 public swapCooldown = 15; // Default cooldown in seconds
 
-    // Store last swap timestamp for cooldown tracking
-    mapping(address => uint256) private lastSwapTimestamp;
-
-    // Error messages for reverts
     error MEVDetected();
     error SandwichDetected();
     error BotBlocked();
     error CooldownNotMet();
+    error LiquidityImbalance();
 
-    constructor(IPoolManager _poolManager) {
+    address public constant GROW_WETH = 0xae638fa12721ca810d447fb53be9a123f2744600;
+    address public constant GROW_USDT = 0xbcc2373d7ce0106821a9c63aadb4bd6d91195e30;
+    address public constant GROW_WIN  = 0x72f14610933b8abb191c61f0d95f66fe92565647;
+    address public constant GROW_SWITCH = 0x5612b2e9d3123d9f16e44a3f236cf531adb69bc6;
+
+    constructor(IPoolManager _poolManager, IOracle _priceOracle) Ownable() {
         poolManager = _poolManager;
+        priceOracle = _priceOracle;
 
-        // Predefined MEV bot addresses (can be updated)
-        blockedAddresses[0xae2Fc483527B8EF99EB5D9B44875F005ba1FaE13] = true; // JaredFromSubway MEV bot
-        blockedAddresses[0x1f2F10D1C40777AE1Da742455c65828FF36Df387] = true; // Alternate Jared bot
+        blockedAddresses[0xae2Fc483527B8EF99EB5D9B44875F005ba1FaE13] = true;
+        blockedAddresses[0x1f2F10D1C40777AE1Da742455c65828FF36Df387] = true;
+        blockedAddresses[0x000000000035b5e5ad9019092c665357240f594e] = true;
     }
 
     function beforeSwap(
@@ -44,67 +48,85 @@ contract AntiMEVHook is IBaseHook {
         uint256 currentBlock = block.number;
         uint256 previousBlock = lastSwapBlock[sender];
 
-        // Block known MEV bots before execution
         if (blockedAddresses[sender]) {
             revert BotBlocked();
         }
-
-        // Prevent back-to-back swaps within the same block (Anti-Sandwich)
         if (previousBlock == currentBlock) {
             revert SandwichDetected();
         }
-
-        // Enforce cooldown period to slow down bot activity
         if (block.timestamp < lastSwapTimestamp[sender] + swapCooldown) {
             revert CooldownNotMet();
         }
 
-        // Fetch pool price before the swap
-        uint256 previousPrice = lastSwapPrice[sender];
-        uint256 currentPrice = getPoolPrice(key);
+        uint256 oraclePrice = priceOracle.getLatestPrice(key);
+        uint256 poolPrice = getPoolPrice(key);
 
-        // Detect excessive price deviation (>1%) to prevent front-running
-        if (previousPrice != 0 && isSignificantDeviation(previousPrice, currentPrice)) {
+        if (lastSwapPrice[sender] != 0 && isSignificantDeviation(lastSwapPrice[sender], poolPrice)) {
             revert MEVDetected();
         }
 
-        // Update sender tracking
         lastSwapBlock[sender] = currentBlock;
-        lastSwapPrice[sender] = currentPrice;
+        lastSwapPrice[sender] = poolPrice;
         lastSwapTimestamp[sender] = block.timestamp;
 
         return IBaseHook.beforeSwap.selector;
     }
 
     function afterSwap(
-        address,
-        PoolKey calldata,
-        IPoolManager.SwapParams calldata,
-        bytes calldata,
-        int256,
-        int256
-    ) external pure override returns (bytes4) {
+        address sender, 
+        PoolKey calldata key, 
+        IPoolManager.SwapParams calldata params, 
+        bytes calldata, 
+        int256 amount0Delta, 
+        int256 amount1Delta
+    ) external override nonReentrant returns (bytes4) {
+        if (isPoolImbalanced(key, amount0Delta, amount1Delta)) {
+            rebalanceLiquidity(key);
+        }
         return IBaseHook.afterSwap.selector;
     }
 
     function getPoolPrice(PoolKey calldata key) internal view returns (uint256) {
         (uint160 sqrtPriceX96, , , , , , ) = poolManager.getSlot0(key);
-        return uint256(sqrtPriceX96);
+        return (uint256(sqrtPriceX96) ** 2) / (2 ** 192);
     }
 
     function isSignificantDeviation(uint256 oldPrice, uint256 newPrice) internal pure returns (bool) {
-        uint256 deviation = oldPrice > newPrice ? oldPrice - newPrice : newPrice - oldPrice;
-        return deviation > (oldPrice / 100); // 1% price deviation threshold
+        uint256 threshold = oldPrice / 100; // 1% deviation limit
+        return (oldPrice > newPrice ? oldPrice - newPrice : newPrice - oldPrice) > threshold;
     }
 
-    // Update blocked addresses dynamically
-    function updateBlockedAddress(address _bot, bool _blocked) external {
+    function isPoolImbalanced(PoolKey calldata key, int256 amount0Delta, int256 amount1Delta) internal view returns (bool) {
+        uint256 reserve0 = poolManager.getReserves(key).reserve0;
+        uint256 reserve1 = poolManager.getReserves(key).reserve1;
+
+        uint256 postSwapReserve0 = uint256(int256(reserve0) + amount0Delta);
+        uint256 postSwapReserve1 = uint256(int256(reserve1) + amount1Delta);
+
+        return (postSwapReserve0 * 100 / reserve0) < 95 || (postSwapReserve1 * 100 / reserve1) < 95;
+    }
+
+    function rebalanceLiquidity(PoolKey calldata key) internal nonReentrant {
+        uint256 liquidity = poolManager.getLiquidity(key);
+        uint256 amountToMove = liquidity / 10;
+
+        if (key.poolAddress == GROW_WETH) {
+            poolManager.modifyPosition(PoolKey({ poolAddress: GROW_USDT }), amountToMove, 0, address(this));
+        } else if (key.poolAddress == GROW_USDT) {
+            poolManager.modifyPosition(PoolKey({ poolAddress: GROW_WIN }), amountToMove, 0, address(this));
+        } else if (key.poolAddress == GROW_WIN) {
+            poolManager.modifyPosition(PoolKey({ poolAddress: GROW_SWITCH }), amountToMove, 0, address(this));
+        } else if (key.poolAddress == GROW_SWITCH) {
+            poolManager.modifyPosition(PoolKey({ poolAddress: GROW_WETH }), amountToMove, 0, address(this));
+        }
+    }
+
+    function updateBlockedAddress(address _bot, bool _blocked) external onlyOwner {
         blockedAddresses[_bot] = _blocked;
     }
 
-    // Adjust swap cooldown duration
-    function updateCooldown(uint256 _cooldown) external {
-        require(_cooldown <= 60, "Cooldown too high"); // Max: 60 seconds
+    function updateCooldown(uint256 _cooldown) external onlyOwner {
+        require(_cooldown <= 60, "Cooldown too high");
         swapCooldown = _cooldown;
     }
 }
